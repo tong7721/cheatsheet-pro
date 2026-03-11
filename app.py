@@ -1,20 +1,9 @@
 import html
 import re
 import base64
-import asyncio
-import sys
 
 import streamlit as st
 import streamlit.components.v1 as components
-
-
-# Windows + some event-loop configurations may not support subprocesses,
-# which Playwright needs for launching the browser driver.
-if sys.platform.startswith("win"):
-    try:
-        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-    except Exception:
-        pass
 
 
 def _inline_format(text: str) -> str:
@@ -93,12 +82,12 @@ def markdown_to_html(md: str) -> str:
 def build_export_html(
     *,
     base_css: str,
-    aspect_ratio: str,
     orientation: str,
     sides: str,
     font_px: int,
     columns: int,
     content_html: str,
+    filename: str,
 ) -> str:
     landscape = not orientation.startswith("纵向")
     page_w = "297mm" if landscape else "210mm"
@@ -232,40 +221,32 @@ def build_export_html(
         }}
         const src = document.getElementById('source');
         if (src) src.remove();
-        // mark done so playwright can proceed
-        window.__CS_PAGINATED__ = true;
+      }}
+    </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+    <script>
+      function exportPdf() {{
+        const stack = document.getElementById('stack');
+        if (!stack || !window.html2pdf) return;
+        const opt = {{
+          margin:       0,
+          filename:     "{filename}",
+          image:        {{ type: 'jpeg', quality: 0.98 }},
+          html2canvas:  {{ scale: 2, useCORS: true }},
+          jsPDF:        {{ unit: 'mm', format: 'a4', orientation: '{'landscape' if landscape else 'portrait'}' }}
+        }};
+        window.html2pdf().set(opt).from(stack).save();
       }}
       window.addEventListener('load', () => {{
-        setTimeout(paginate, 50);
+        setTimeout(() => {{
+          paginate();
+          setTimeout(exportPdf, 200);
+        }}, 60);
       }});
     </script>
   </body>
 </html>
 """
-
-
-def render_pdf_with_playwright(html_doc: str, *, landscape: bool) -> bytes:
-    try:
-        from playwright.sync_api import sync_playwright
-    except Exception as e:  # pragma: no cover
-        raise RuntimeError(
-            "缺少依赖 playwright。请先执行：python -m pip install playwright && python -m playwright install"
-        ) from e
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch()
-        page = browser.new_page(viewport={"width": 1280, "height": 720})
-        page.set_content(html_doc, wait_until="load")
-        page.wait_for_function("window.__CS_PAGINATED__ === true", timeout=15_000)
-        pdf_bytes = page.pdf(
-            format="A4",
-            landscape=landscape,
-            print_background=True,
-            prefer_css_page_size=True,
-            margin={"top": "0mm", "right": "0mm", "bottom": "0mm", "left": "0mm"},
-        )
-        browser.close()
-        return pdf_bytes
 
 
 DEFAULT_MD = """# CheatSheet Pro 一页纸速记模板
@@ -412,6 +393,47 @@ div[data-testid="stMarkdownContainer"]{ overflow: visible; }
 .content ul, .content ol { margin: 0 0 0.55em 1.1em; padding: 0; }
 .content li { margin: 0.12em 0; }
 .content strong { font-weight: 700; }
+@media print {
+  /* 只打印右侧 A4 预览区域 */
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #ffffff !important;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+  /* 隐藏 Streamlit 自己的框架和左侧控制区 */
+  main, header, footer, section, [data-testid="stSidebar"], [data-testid="stHeader"] {
+    visibility: hidden !important;
+  }
+  /* 仅让画布和纸张可见并参与打印 */
+  .canvas-wrap, .canvas-wrap * {
+    visibility: visible !important;
+  }
+  .canvas-wrap {
+    position: fixed;
+    inset: 0;
+    margin: 0;
+    padding: 0;
+    border-radius: 0;
+    background: #ffffff !important;
+    box-shadow: none !important;
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
+  }
+  .viewport {
+    width: auto !important;
+    height: auto !important;
+  }
+  .scaler {
+    transform: none !important; /* 打印使用真实 A4 尺寸，不再缩放 */
+  }
+  .a4-paper {
+    box-shadow: none !important;
+    border-radius: 0;
+  }
+}
 </style>
 """
 
@@ -466,8 +488,9 @@ with col_left:
         st.caption(f"字数统计：不含空格 {chars_no_ws} ｜ 含空格 {chars_with_ws} ｜ 行数 {lines_count}")
 
         st.markdown("")
-        st.caption("导出将按当前：单/双面、横/竖版、字号、分栏生成 A4 PDF")
+        st.caption("导出将按当前：单/双面、横/竖版、字号、分栏生成 A4 PDF；云端推荐使用浏览器打印为 PDF。")
         export_now = st.button("导出 PDF（点击直接下载）", use_container_width=True)
+        print_now = st.button("浏览器打印 / 导出 PDF（云端推荐）", use_container_width=True)
 
 
 aspect_ratio = "1 / 1.414" if orientation.startswith("纵向") else "1.414 / 1"
@@ -486,26 +509,30 @@ def _cached_pdf(
     font_px_value: int,
     columns_value: int,
 ) -> bytes:
-    html_doc = build_export_html(
-        base_css=BASE_CSS,
-        aspect_ratio=("1 / 1.414" if orientation_value.startswith("纵向") else "1.414 / 1"),
-        orientation=orientation_value,
-        sides=sides_value,
-        font_px=font_px_value,
-        columns=columns_value,
-        content_html=markdown_to_html(md),
-    )
-    return render_pdf_with_playwright(html_doc, landscape=(not orientation_value.startswith("纵向")))
+    # 仅保留签名以避免缓存失效错误；实际 PDF 由前端 html2pdf 生成
+    return b""
 
 
 if export_now:
     filename = "CheatSheet-Pro-双面.pdf" if sides.startswith("双面") else "CheatSheet-Pro-单面.pdf"
     with st.spinner("导出 PDF 生成中…"):
         try:
-            pdf_data = _cached_pdf(md_text, orientation, sides, font_px, columns)
-            b64 = base64.b64encode(pdf_data).decode("ascii")
             components.html(
-                f"""
+                build_export_html(
+                    base_css=BASE_CSS,
+                    orientation=orientation,
+                    sides=sides,
+                    font_px=font_px,
+                    columns=columns,
+                    content_html=content_html,
+                    filename=filename,
+                ),
+                height=0,
+                scrolling=False,
+            )
+            st.success("浏览器正在生成并下载 PDF（如果被拦截，请允许下载后重试）。")
+        except Exception as e:
+            st.error(str(e))
 <!doctype html>
 <html>
   <head><meta charset="utf-8" /></head>
@@ -539,6 +566,25 @@ if export_now:
             st.success("已开始下载 PDF（如果浏览器拦截下载，请允许本地下载后重试）。")
         except Exception as e:
             st.error(str(e))
+
+if print_now:
+    components.html(
+        """
+<!doctype html>
+<html>
+  <head><meta charset="utf-8" /></head>
+  <body>
+    <script>
+      window.addEventListener('load', function () {
+        window.print();
+      });
+    </script>
+  </body>
+</html>
+""",
+        height=0,
+        scrolling=False,
+    )
 
 with col_right:
     if sides.startswith("单面"):
